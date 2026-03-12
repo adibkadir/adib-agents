@@ -117,28 +117,31 @@ Based on a thorough review of the following codebases:
 
 ---
 
-### 6. `web-scraper` — Web Scraping & Data Pipeline Engineer
+### 6. `web-scraper` — Web Scraper & Data Extraction Engineer
 
-**Why:** scraper-prototyping has 21 scrapers across 11 cruise lines. croozie-next has integrated Playwright scrapers wired into pg-boss job queues with admin monitoring. WebCred scrapes 10+ review sources with coordinated job dispatch.
+**Why:** scraper-prototyping has 21 scrapers across 11 cruise lines. croozie-next has integrated scrapers. WebCred scrapes 10+ review sources. Primary approach is intercepting network requests and replaying raw API calls — browsers and paid tools are last resorts.
 
 **Capabilities:**
-- Strategy selection: fetch+regex → REST API → GraphQL → Playwright → Firecrawl
-- Playwright browser automation (headless Chromium, Xvfb, anti-bot evasion)
-- Firecrawl SDK for bot-protected sites (proxy auto-escalation)
-- API reverse engineering (minified JS analysis, GraphQL introspection, Solr facets)
-- Apify integration for Google/Yelp/Facebook scraping
-- Puppeteer with stealth plugin
-- Data normalization to standardized JSON schemas
-- Rate limiting and throughput control
-- Zod schema validation for extracted data
-- Network request interception patterns
-- pg-boss v12 job queues (dual-client pattern, cron scheduling, staggered dispatch)
-- Worker processes with auto-restart, job chaining, and retry logic
-- Next.js admin dashboards for job monitoring, run tracking, and manual dispatch
-- better-auth admin role gating for all job management endpoints
-- Health check endpoints validating worker connectivity
+- Network request interception and raw HTTP replay with correct headers (primary approach)
+- API reverse engineering from DevTools network tab, minified JS bundles, GraphQL introspection, Solr facets
+- Direct fetch with REST, GraphQL, Solr, Algolia BFF replay
+- Pagination: offset, cursor, date windowing, infinite scroll
+- Cookie/session management and token extraction from HTML
+- Playwright response interception (`page.on('response')`) for SPAs with auth cookies
+- In-browser fetch (`page.evaluate`) to reuse authenticated sessions
+- Anti-detection: navigator spoofing, `headless: false` + Xvfb, bot challenge detection
+- Crawlee framework: AdaptivePlaywrightCrawler, proxy rotation, session pools, fingerprinting, RequestQueue
+- Firecrawl API: markdown/HTML/rawHtml scraping, LLM-powered structured extraction with Zod, stealth proxy, crawling, search, agent, browser sandbox
+- Mobile app emulation: Python + uiautomator2, mobile-mcp, scrcpy-mcp, raw ADB commands
+- Standalone Node.js scripts — tested independently before integration
+- Data normalization to standardized JSON with Zod validation
+- 5-tier escalation ladder: fetch → Playwright → Crawlee → Firecrawl → Mobile emulator
+- Next.js `/admin/scrapers` page: list scrapers, execute on-demand, show status/errors, JSON textarea with copy button, localStorage caching across refreshes
+- Next.js `/admin/jobs` page: pg-boss job monitoring, queue filters, run tracking with progress bars, 5s polling
+- pg-boss v12 dual-client pattern, cron scheduling, staggered dispatch, job chaining
+- better-auth admin role gating for all admin endpoints
 
-**Skills needed:** `playwright-scraping`, `firecrawl`, `api-reverse-engineering`, `data-normalization`, `pg-boss-jobs`, `job-admin-pages`
+**Skills:** `api-reverse-engineering`, `http-replay-scraping`, `data-normalization`, `playwright-interception`, `crawlee`, `firecrawl`, `mobile-emulator-fallback`, `scraper-admin-ui`, `pg-boss-jobs`, `job-admin-ui`
 
 ---
 
@@ -159,8 +162,17 @@ Based on a thorough review of the following codebases:
 - OffthreadVideo for performance
 - Tailwind v4 integration with Remotion
 - JPEG output optimization
+- Captions and subtitles (SRT import, transcription, display)
+- Audio visualization (spectrum bars, waveforms, bass-reactive effects)
+- 3D content with React Three Fiber
+- Charts and data visualization (bar, pie, line, stock)
+- Maps with Mapbox integration
+- AI-generated voiceover with ElevenLabs TTS
+- Transparent video rendering
+- Dynamic metadata with calculateMetadata
+- Parametrizable videos with Zod schemas
 
-**Skills needed:** `remotion-composition`, `spring-animation`, `video-audio-sync`
+**Skills:** `remotion` (official Remotion best practices — 38 rule files covering animations, timing, sequencing, transitions, audio, video, captions, 3D, charts, fonts, maps, voiceover, and more), `video-production-patterns` (production patterns from hearst-ai-videos, videos-croozie, videos-slidemark — segment-driven architecture, Ken Burns, spring presets, frame-locked voiceover sync, cinematic overlays, editorial typography)
 
 ---
 
@@ -184,22 +196,26 @@ Based on a thorough review of the following codebases:
 
 ---
 
-### 9. `cloud-storage` — Cloud Storage & CDN Engineer
+### 9. `cloud-storage` — Cloudflare R2 Storage Engineer
 
-**Why:** Cloudflare R2 (S3-compatible) is used in slidemark, WebCred, adibkadir-site. AWS S3 patterns appear across projects.
+**Why:** Cloudflare R2 (S3-compatible) is used in croozie-next, slidemark, and adibkadir-site with distinct upload strategies (direct, presigned, base64). Each project has different patterns for client configuration, file naming, and lifecycle management.
 
 **Capabilities:**
-- Cloudflare R2 setup with AWS SDK S3 client
-- Presigned URL generation for direct client uploads
-- Media upload flow (presign → client upload → record metadata)
-- Image optimization and CDN delivery
-- File lifecycle management (expiry, cleanup)
-- R2 bucket configuration
-- CORS and access control
-- Resend email integration for transactional emails
-- Umami analytics setup (self-hosted)
+- R2 S3 client configuration (`forcePathStyle`, `requestChecksumCalculation`, singleton pattern)
+- Presigned URL generation for direct-to-R2 browser uploads (PUT with `unhoistableHeaders`)
+- Presigned download URLs with client-side caching and deduplication
+- Direct server uploads via Server Actions and API routes
+- Base64 buffer uploads for AI-generated images
+- URL-fetch-and-store pattern (download from external URL → upload to R2)
+- Media database tracking with Drizzle ORM (key, filename, contentType, size)
+- Orphaned media cleanup cron jobs (content-aware detection)
+- Cascade deletion of R2 objects when entities are deleted
+- File validation (type allowlists, size limits)
+- CDN domain configuration for public asset serving
+- Avatar upload pattern (overwrite-on-update with user-scoped keys)
+- Worker-side uploads for export/generation pipelines
 
-**Skills needed:** `cloudflare-r2`, `presigned-uploads`, `resend-email`
+**Skills needed:** `r2-client-setup`, `presigned-urls`, `upload-patterns`, `media-management`
 
 ---
 
@@ -227,23 +243,29 @@ Based on a thorough review of the following codebases:
 
 ### 11. `devops-deploy` — DevOps & Deployment Engineer
 
-**Why:** Docker multi-stage builds, pnpm workspaces, monorepo patterns, Dokploy, Traefik, and EAS builds appear across projects.
+**Why:** Every production project uses Docker multi-stage builds with Next.js standalone output. croozie-next and slidemark run pg-boss workers alongside Next.js via entrypoint scripts. WebCred uses Dokploy with Traefik wildcard routing and init containers for migrations.
 
 **Capabilities:**
-- Docker multi-stage builds (Alpine Node 20 deps/builder, slim runtime)
-- pnpm workspace configuration for monorepos
-- Standalone Next.js output (`.next/standalone`)
-- EAS build profiles for Expo apps
-- Dokploy (Docker PaaS) deployment
-- Traefik reverse proxy for multi-tenant subdomain routing
-- Let's Encrypt SSL with DNS challenge
-- Environment variable management (.env patterns)
-- GitHub Actions CI/CD
-- Node.js version management (.node-version)
-- TypeScript compilation for shared packages
-- OpenTelemetry monitoring setup
+- Docker multi-stage builds (3-stage: deps → builder → runner, Alpine and Debian Slim)
+- Next.js standalone output with `serverExternalPackages` for pg-boss/postgres
+- Monorepo Docker builds with `outputFileTracingRoot` and pnpm workspaces
+- Dokploy deployment with docker-compose, env_file, and GitHub integration
+- Traefik labels for wildcard subdomain routing (`HostRegexp`)
+- Let's Encrypt TLS (HTTP challenge for apex, DNS challenge for wildcard)
+- Docker entrypoint scripts (migrations → worker → Next.js)
+- Worker auto-restart loops with background subshells
+- Xvfb + Chromium for headless browser automation in containers
+- Init containers for database migrations (`service_completed_successfully`)
+- Drizzle ORM migration strategies (`drizzle-kit push` vs `drizzle-kit migrate`)
+- Schema verification after migration
+- Health check endpoints validating database + worker connectivity
+- Non-root users (UID 1001) in production containers
+- `.dockerignore` patterns for clean builds
+- Build-time vs runtime environment variable management
+- Dev mode: `concurrently` for Next.js + worker with `--kill-others-on-fail`
+- Graceful shutdown with SIGTERM/SIGINT handlers
 
-**Skills needed:** `docker-nextjs`, `pnpm-monorepo`, `eas-builds`, `dokploy-traefik`
+**Skills needed:** `docker-nextjs`, `dokploy-traefik`, `worker-entrypoint`, `db-migrations`
 
 ---
 
@@ -277,8 +299,8 @@ Based on a thorough review of the following codebases:
 | `database-architect` | `drizzle-orm`, `postgresql-patterns`, `better-auth-schema` |
 | `auth-engineer` | `better-auth`, `rbac-patterns`, `session-management` |
 | `background-jobs` | `pg-boss-worker`, `motia-workflows`, `job-orchestration` |
-| `web-scraper` | `playwright-scraping`, `firecrawl`, `api-reverse-engineering`, `data-normalization` |
-| `remotion-video` | `remotion-composition`, `spring-animation`, `video-audio-sync` |
+| `web-scraper` | `api-reverse-engineering`, `http-replay-scraping`, `data-normalization`, `playwright-interception`, `crawlee`, `firecrawl`, `mobile-emulator-fallback`, `scraper-admin-ui`, `pg-boss-jobs`, `job-admin-ui` |
+| `remotion-video` | `remotion`, `video-production-patterns` |
 | `ai-integration` | `openrouter-sdk`, `ai-content-pipeline`, `structured-ai-output` |
 | `cloud-storage` | `cloudflare-r2`, `presigned-uploads`, `resend-email` |
 | `ui-components` | `tailwind-v4`, `radix-shadcn`, `rich-text-editor`, `data-visualization` |

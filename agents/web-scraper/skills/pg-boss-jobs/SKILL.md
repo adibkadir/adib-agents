@@ -1,18 +1,35 @@
 ---
 name: pg-boss-jobs
-description: pg-boss v12 job queue patterns with PostgreSQL — dual-client setup, typed job handlers, cron scheduling, staggered dispatch, retry logic, job chaining, health checks, and Docker worker deployment. Use when building background job infrastructure, worker processes, or queue-based scrape pipelines.
+description: "pg-boss v12 job queue integration for scrapers — dual-client setup, typed job handlers, cron scheduling, staggered dispatch, retry logic, job chaining, health checks, and Docker worker deployment. Assumes PostgreSQL with DATABASE_URL. If no DATABASE_URL found, ask the user how to manage background jobs."
 ---
 
-# pg-boss Job Queue Patterns
+# pg-boss Job Queue Integration
+
+When scrapers need to run on a schedule or be dispatched via API, wrap them in pg-boss job handlers. Assumes the project uses PostgreSQL — look for `DATABASE_URL` in `.env` or environment. If not found, **ask the user** how they want to manage workers and background jobs.
+
+## Pre-Check
+
+Before setting up pg-boss:
+
+```bash
+# Check if DATABASE_URL exists
+grep -r 'DATABASE_URL' .env .env.local .env.* 2>/dev/null
+
+# Check if pg-boss is already installed
+grep 'pg-boss' package.json
+```
+
+If `DATABASE_URL` is found → proceed with pg-boss setup.
+If not found → ask: "I don't see a PostgreSQL DATABASE_URL. How would you like to manage background jobs? Options: (1) Set up PostgreSQL + pg-boss, (2) Use a simpler approach like node-cron, (3) Skip background jobs for now."
 
 ## Dual-Client Pattern
 
-The web process (Next.js) uses a send-only client. The worker process uses a full client with scheduling and supervision enabled. Never enable the scheduler in the web process.
+The web process (Next.js) uses a send-only client. The worker process uses a full client with scheduling.
 
 ### Send-Only Client (API Routes)
 
 ```typescript
-// worker/boss.ts — shared singleton for Next.js API routes
+// worker/boss.ts — singleton for Next.js API routes
 import PgBoss from 'pg-boss'
 
 const globalForBoss = globalThis as unknown as {
@@ -30,9 +47,10 @@ export function getBoss(): Promise<PgBoss> {
     })
     globalForBoss.__pgBoss = boss
     globalForBoss.__pgBossReady = boss.start().then(async () => {
+      // Create all queues used by scrapers
       await Promise.all([
-        boss.createQueue('sailing-scrape'),
-        boss.createQueue('sailing-report'),
+        boss.createQueue('scraper-execute'),
+        boss.createQueue('scraper-report'),
         boss.createQueue('health-check'),
       ])
       return boss
@@ -42,219 +60,170 @@ export function getBoss(): Promise<PgBoss> {
 }
 ```
 
-Why `globalThis`: Survives Next.js hot reloads in dev. Without it, each reload spawns a new pg-boss connection.
-
 ### Full Worker Client
 
 ```typescript
 // worker/index.ts — standalone worker process
 import PgBoss from 'pg-boss'
+import { handleScraperExecute } from './jobs/scraper-execute'
+import { handleScraperReport } from './jobs/scraper-report'
 
 const boss = new PgBoss({
   connectionString: process.env.DATABASE_URL!,
   schema: 'pgboss',
-  // defaults: schedule + supervise enabled
 })
 
 await boss.start()
 
-// Create all queues before registering workers
 await Promise.all([
-  boss.createQueue('sailing-scrape'),
-  boss.createQueue('sailing-report'),
+  boss.createQueue('scraper-execute'),
+  boss.createQueue('scraper-report'),
   boss.createQueue('health-check'),
 ])
+
+// Register job handlers
+await boss.work<ScraperExecuteInput>('scraper-execute', async (jobs) => {
+  for (const job of jobs) {
+    await handleScraperExecute(job.data, boss)
+  }
+})
+
+await boss.work<ScraperReportInput>('scraper-report', async (jobs) => {
+  for (const job of jobs) {
+    await handleScraperReport(job.data)
+  }
+})
+
+await boss.work('health-check', async () => {
+  console.log('Health check OK')
+})
+
+console.log('Worker running. Waiting for jobs...')
 ```
 
 ## Typed Job Inputs
 
-Every queue has a TypeScript interface. No `any` types.
-
 ```typescript
-// worker/jobs/sailing-scrape.ts
-export interface SailingScrapeInput {
-  shipSlug: string
-  shipName: string
-  shipCode: string
-  cruiseLineSlug: string
+// worker/jobs/scraper-execute.ts
+export interface ScraperExecuteInput {
+  scraperId: string
+  params: Record<string, string>
   runId: string
   totalExpected: number
-  dryRun?: boolean
+}
+
+export async function handleScraperExecute(data: ScraperExecuteInput, boss: PgBoss) {
+  const { scraperId, params, runId, totalExpected } = data
+
+  try {
+    // Dynamic import the scraper from registry
+    const { SCRAPER_REGISTRY } = await import('@/app/admin/scrapers/scraper-registry')
+    const scraper = SCRAPER_REGISTRY.find(s => s.id === scraperId)
+    if (!scraper) throw new Error(`Scraper '${scraperId}' not found`)
+
+    const result = await scraper.execute(params)
+
+    // Chain: report success
+    await boss.send('scraper-report', {
+      runId,
+      scraperId,
+      totalExpected,
+      success: result.success,
+      recordCount: result.meta?.count ?? 0,
+      error: result.error,
+    })
+  } catch (error) {
+    // Chain: report failure
+    await boss.send('scraper-report', {
+      runId,
+      scraperId,
+      totalExpected,
+      success: false,
+      recordCount: 0,
+      error: String(error),
+    })
+    throw error
+  }
 }
 ```
 
-## Registering Workers
-
-pg-boss v12 delivers jobs as arrays. Process one at a time inside the handler.
+## Sending Jobs (from API or Admin UI)
 
 ```typescript
-// worker/index.ts
-import { handleSailingScrape } from './jobs/sailing-scrape'
-
-await boss.work<SailingScrapeInput>('sailing-scrape', async (jobs) => {
-  for (const job of jobs) {
-    await handleSailingScrape(job.data, boss, logger)
-  }
-})
-
-// Simple handler
-await boss.work('health-check', async () => {
-  logger.info('Health check processed')
-})
-
-// With batch size control
-await boss.work('port-enrich', { batchSize: 1 }, async (jobs) => {
-  for (const job of jobs) {
-    await handlePortEnrich(job.data)
-  }
-})
-```
-
-## Sending Jobs
-
-### Basic Send
-
-```typescript
+// Dispatch a single scraper job
 const boss = await getBoss()
-const jobId = await boss.send('sailing-scrape', {
-  shipSlug: 'carnival-celebration',
-  shipName: 'Carnival Celebration',
-  shipCode: 'CE',
-  cruiseLineSlug: 'carnival',
+const runId = crypto.randomUUID()
+
+await boss.send('scraper-execute', {
+  scraperId: 'example-sailings',
+  params: { shipCode: 'CE', guests: '2' },
   runId,
   totalExpected: 1,
 })
-```
 
-### With Options
+// Dispatch multiple scrapers with staggered timing
+const DELAY_MS = 30_000
 
-```typescript
-await boss.send('sailing-scrape', jobData, {
-  expireInSeconds: 600,   // expires if not completed in 10 min
-  retryLimit: 1,          // retry once on failure
-  retryDelay: 30,         // wait 30s before retry
-})
-```
-
-### Staggered Dispatch (Rate Limiting)
-
-Use `startAfter` to space out jobs and avoid overwhelming target sites:
-
-```typescript
-const DELAY_MS = 30_000  // 30s between jobs
-const DISNEY_DELAY_MS = 2 * 60 * 1000  // Disney needs more spacing
-
-for (let i = 0; i < ships.length; i++) {
-  const delay = ships[i].cruiseLineSlug === 'disney' ? DISNEY_DELAY_MS : DELAY_MS
-  await boss.send('sailing-scrape', {
-    shipSlug: ships[i].slug,
-    shipName: ships[i].name,
-    shipCode: ships[i].shipCode,
-    cruiseLineSlug: ships[i].cruiseLineSlug,
+for (let i = 0; i < scraperIds.length; i++) {
+  await boss.send('scraper-execute', {
+    scraperId: scraperIds[i],
+    params: {},
     runId,
-    totalExpected: ships.length,
+    totalExpected: scraperIds.length,
   }, {
-    ...(i > 0 ? { startAfter: new Date(Date.now() + delay * i) } : {}),
+    ...(i > 0 ? { startAfter: new Date(Date.now() + DELAY_MS * i) } : {}),
+    expireInSeconds: 600,
+    retryLimit: 1,
+    retryDelay: 30,
   })
-}
-```
-
-## Job Chaining
-
-Jobs can enqueue downstream jobs on completion or failure:
-
-```typescript
-// worker/jobs/sailing-scrape.ts
-export async function handleSailingScrape(
-  data: SailingScrapeInput,
-  boss: PgBoss,
-  logger: Logger
-) {
-  try {
-    const sailings = await scrapeSailings(data)
-
-    // Persist results
-    await db.insert(cruiseSailings).values(sailings)
-
-    // Chain: send report job
-    await boss.send('sailing-report', {
-      runId: data.runId,
-      totalExpected: data.totalExpected,
-      shipSlug: data.shipSlug,
-      cruiseLineSlug: data.cruiseLineSlug,
-      success: true,
-      sailingCount: sailings.length,
-    })
-  } catch (error) {
-    // Chain even on failure — coordinator needs to know
-    await boss.send('sailing-report', {
-      runId: data.runId,
-      totalExpected: data.totalExpected,
-      shipSlug: data.shipSlug,
-      cruiseLineSlug: data.cruiseLineSlug,
-      success: false,
-      error: String(error),
-      sailingCount: 0,
-    })
-    throw error  // let pg-boss mark the job as failed
-  }
 }
 ```
 
 ## Cron Scheduling
 
-Scheduled jobs run in the worker process only (where `schedule: true`).
-
 ```typescript
-// worker/index.ts — schedule cron jobs after boss.start()
+// worker/index.ts — register cron after boss.start()
 
-// Every 6 months: Jan 1 and Jul 1 at midnight
-await boss.schedule('ship-scrape-cron', '0 0 1 1,7 *', {})
+// Daily at 2am
+await boss.schedule('daily-scrape', '0 2 * * *', {})
 
-await boss.work('ship-scrape-cron', async () => {
+await boss.work('daily-scrape', async () => {
   const runId = crypto.randomUUID()
-  await db.insert(scrapeRuns).values({
-    id: runId,
-    type: 'ship',
-    totalExpected: CRUISE_LINE_SLUGS.length,
-  })
+  const scraperIds = ['example-sailings', 'example-ships']
 
-  for (const cruiseLineSlug of CRUISE_LINE_SLUGS) {
-    await boss.send('ship-scrape', {
-      cruiseLineSlug,
+  for (let i = 0; i < scraperIds.length; i++) {
+    await boss.send('scraper-execute', {
+      scraperId: scraperIds[i],
+      params: {},
       runId,
-      totalExpected: CRUISE_LINE_SLUGS.length,
+      totalExpected: scraperIds.length,
+    }, {
+      ...(i > 0 ? { startAfter: new Date(Date.now() + 30_000 * i) } : {}),
     })
   }
 })
-
-// Hourly cleanup
-await boss.schedule('export-cleanup', '0 * * * *', {})
 ```
 
 ## Run Tracking Schema
 
-Track scrape runs at the application level alongside pg-boss internal state:
-
 ```typescript
 // db/schema.ts
+import { pgTable, text, integer, timestamp } from 'drizzle-orm/pg-core'
+
 export const scrapeRuns = pgTable('scrape_runs', {
-  id: text('id').primaryKey(),   // UUID
-  type: text('type').notNull(),  // 'sailing' | 'ship' | 'review'
-  cruiseLineSlug: text('cruise_line_slug'),
+  id: text('id').primaryKey(),
+  type: text('type').notNull(),
   totalExpected: integer('total_expected').notNull().default(0),
   totalCompleted: integer('total_completed').notNull().default(0),
   totalSucceeded: integer('total_succeeded').notNull().default(0),
   totalFailed: integer('total_failed').notNull().default(0),
-  status: text('status').notNull().default('running'),  // running | completed | failed
+  status: text('status').notNull().default('running'),
   startedAt: timestamp('started_at').defaultNow(),
   completedAt: timestamp('completed_at'),
 })
 ```
 
-## Health Check Pattern
-
-End-to-end test that the worker is alive and processing jobs:
+## Health Check
 
 ```typescript
 // app/api/health-test/route.ts
@@ -263,32 +232,25 @@ export async function GET() {
   const jobId = await boss.send('health-check', { ts: Date.now() })
   if (!jobId) throw new Error('Failed to enqueue health-check job')
 
-  // Poll for completion (up to 10s)
   for (let i = 0; i < 50; i++) {
     await new Promise(r => setTimeout(r, 200))
     const job = await boss.getJobById('health-check', jobId)
     if (!job) throw new Error('Job disappeared')
-    if (job.state === 'completed') {
-      return Response.json({ status: 'ok', worker: 'alive' })
-    }
-    if (job.state === 'failed') {
-      throw new Error('Health-check job failed in worker')
-    }
+    if (job.state === 'completed') return Response.json({ status: 'ok' })
+    if (job.state === 'failed') throw new Error('Job failed')
   }
-  throw new Error('Health-check job timed out (10s)')
+  throw new Error('Timed out')
 }
 ```
 
-## Docker Deployment
-
-Run worker and Next.js in the same container with auto-restart:
+## Docker Worker Deployment
 
 ```bash
 #!/bin/sh
 # docker-entrypoint.sh
 set -e
 
-echo "Running database migrations..."
+echo "Running migrations..."
 npx tsx db/migrate.ts
 
 echo "Starting worker..."
@@ -296,7 +258,7 @@ echo "Starting worker..."
   while true; do
     node --import tsx worker/index.ts
     EXIT_CODE=$?
-    echo "Worker exited with code $EXIT_CODE, restarting in 5s..."
+    echo "Worker exited ($EXIT_CODE), restarting in 5s..."
     sleep 5
   done
 ) &
@@ -305,43 +267,14 @@ echo "Starting Next.js..."
 exec node server.js
 ```
 
-```dockerfile
-# Dockerfile — relevant section
-COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
-```
-
 ## Job States Reference
 
 | State | Meaning |
 |-------|---------|
-| `created` | Queued, waiting to start |
-| `active` | Currently being processed by a worker |
-| `completed` | Successfully finished |
+| `created` | Queued, waiting |
+| `active` | Being processed |
+| `completed` | Finished successfully |
 | `failed` | Processing threw an error |
 | `retry` | Failed, waiting to retry |
-| `expired` | Timed out before completion |
+| `expired` | Timed out |
 | `cancelled` | Manually cancelled |
-
-## Querying Job Status Directly
-
-For admin dashboards, query pg-boss's internal tables:
-
-```typescript
-const result = await db.execute(sql`
-  SELECT id::text, name, state, data, created_on, started_on, completed_on, output
-  FROM pgboss.job
-  WHERE name IN ('sailing-scrape', 'sailing-report', 'ship-scrape')
-  ORDER BY created_on DESC
-  LIMIT ${limit}
-`)
-
-// Filter by runId in job data
-const runJobs = await db.execute(sql`
-  SELECT id::text, name, state, data, created_on, started_on, completed_on, output
-  FROM pgboss.job
-  WHERE data->>'runId' = ${runId}
-  ORDER BY created_on DESC
-`)
-```
